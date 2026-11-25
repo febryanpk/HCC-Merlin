@@ -70,13 +70,17 @@ Train and validation contrastive loss. At T = 0.07 the validation loss turns upw
 
 ## Setup
 
-Python 3.9 is required. Install PyTorch for your CUDA version first, then:
+Create the conda environment (Python 3.9, PyTorch 2.6 with CUDA 12.4):
 
 ```bash
-pip install monai transformers peft deep_pipe huggingface_hub nibabel nltk scikit-learn pandas openpyxl tqdm wandb
+conda env create -f environment.yml
 ```
 
-The code was run with torch 2.6, monai 1.5, transformers 4.53 and peft 0.17 on a single NVIDIA RTX A6000 (48 GB).
+```bash
+conda activate hcc-merlin
+```
+
+For a different CUDA version, change the PyTorch index URL in `environment.yml`. The experiments were run on a single NVIDIA RTX A6000 (48 GB).
 
 The pretrained Merlin weights are downloaded from the [Hugging Face Hub](https://huggingface.co/stanfordmimi/Merlin) into `merlin/models/checkpoints/` the first time a model is built.
 
