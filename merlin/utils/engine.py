@@ -43,19 +43,24 @@ def train_one_epoch(
          image_features, text_features, avg_cosine_similarity)
     """
     model.train()
+    # Keep the pretrained BatchNorm running stats fixed: the image encoder is
+    # frozen or LoRA-adapted, and in train mode its stats would drift (once per
+    # checkpoint recompute, i.e. up to 3x per step)
+    for module in model.modules():
+        if isinstance(module, nn.modules.batchnorm._BatchNorm):
+            module.eval()
     total_loss = ctr_loss_sum = cls_loss_sum = 0.0
     image_embeddings, text_embeddings = [], []
 
+    optimizer.zero_grad(set_to_none=True)
     pbar = tqdm(train_loader, desc=f"Training Epoch {epoch + 1}/{args.epochs}")
 
-    for batch in pbar:
+    for batch_idx, batch in enumerate(pbar):
         image = batch["image"].to(device)
+
         text_key = "full_text" if global_step % 2 == 0 else "anatomy_text"
         text = [t.lower() for t in batch[text_key]]
 
-        # labels = batch["labels"].to(device).view(-1, 1).float()
-
-        scheduler.step()
         temperature = model.model.temperature
 
         with autocast(dtype=torch.float16):
@@ -65,6 +70,7 @@ def train_one_epoch(
             txt_emb = txt_emb / txt_emb.norm(dim=-1, keepdim=True)
 
             image_embeddings.append(img_emb.detach().cpu())
+
             text_embeddings.append(txt_emb.detach().cpu())
 
             img_logits = (img_emb @ txt_emb.T) / temperature
@@ -78,30 +84,40 @@ def train_one_epoch(
             # cls_loss = classification_loss_fn(hcc_emb, labels)
             loss = ctr_loss
 
-        scaler.scale(loss).backward()
+        loss_for_backward = loss / accumulation_steps
+        scaler.scale(loss_for_backward).backward()
 
-        if (global_step + 1) % accumulation_steps == 0:
+        should_step = (batch_idx + 1) % accumulation_steps == 0 or (
+            batch_idx + 1
+        ) == len(train_loader)
+        if should_step:
             scaler.step(optimizer)
             scaler.update()
-            optimizer.zero_grad()
 
-        loss_val = loss.detach().item()
-        total_loss += loss_val
+            optimizer.zero_grad(set_to_none=True)
+            scheduler.step()
+
+        loss_train = loss.detach().item()
+        total_loss += loss_train
         ctr_loss_sum += ctr_loss.detach().item()
         # cls_loss_sum += cls_loss.detach().item()
 
         if args.use_wandb:
-            wandb.log({
-                "train_batch_loss": loss_val,
-                "train_contrastive_loss": ctr_loss.detach().item(),
-                # "train_classification_loss": cls_loss.detach().item(),
-                "train_learning_rate": optimizer.param_groups[0]["lr"],
-                "temperature": temperature.item(),
-            }, step=global_step)
+            wandb.log(
+                {
+                    "train_batch_loss": loss_train,
+                    "train_contrastive_loss": ctr_loss.detach().item(),
+                    # "train_classification_loss": cls_loss.detach().item(),
+                    "train_learning_rate": optimizer.param_groups[0]["lr"],
+                    "temperature": temperature.item(),
+                },
+                step=global_step,
+            )
 
         global_step += 1
 
     img_feats = torch.cat(image_embeddings, dim=0)
+
     txt_feats = torch.cat(text_embeddings, dim=0)
     avg_cos = (img_feats * txt_feats).sum(dim=1).mean().item()
 
@@ -148,19 +164,25 @@ def validate_one_epoch(
     image_embeddings, text_embeddings = [], []
 
     with torch.no_grad():
-        for batch in tqdm(val_loader, desc=f"Validating Epoch {epoch + 1}/{args.epochs}"):
+        for batch in tqdm(
+            val_loader, desc=f"Validating Epoch {epoch + 1}/{args.epochs}"
+        ):
             image = batch["image"].to(device)
+
             text = [t.lower() for t in batch["full_text"]]
 
             temperature = model.model.temperature
 
-            with torch.amp.autocast_mode.autocast(device_type=device, dtype=torch.float16):
+            with torch.amp.autocast_mode.autocast(
+                device_type=device, dtype=torch.float16
+            ):
                 img_emb, _, hcc_emb, txt_emb = model(image, text)
 
                 img_emb = img_emb / img_emb.norm(dim=-1, keepdim=True)
                 txt_emb = txt_emb / txt_emb.norm(dim=-1, keepdim=True)
 
                 image_embeddings.append(img_emb.detach().cpu())
+
                 text_embeddings.append(txt_emb.detach().cpu())
 
                 img_logits = (img_emb @ txt_emb.T) / temperature
@@ -172,6 +194,7 @@ def validate_one_epoch(
                     + nn.CrossEntropyLoss()(img_logits.T, targets)
                 ) / 2
                 # cls_loss = classification_loss_fn(hcc_emb, labels)
+
                 loss = ctr_loss
 
             loss_val = loss.detach().item()
@@ -180,16 +203,20 @@ def validate_one_epoch(
             # cls_loss_sum += cls_loss.detach().item()
 
             if args.use_wandb:
-                wandb.log({
-                    "val_batch_loss": loss_val,
-                    "val_contrastive_loss": ctr_loss.detach().item(),
-                    # "val_classification_loss": cls_loss.detach().item(),
-                    "val_temperature": temperature.item(),
-                }, step=global_step)
+                wandb.log(
+                    {
+                        "val_batch_loss": loss_val,
+                        "val_contrastive_loss": ctr_loss.detach().item(),
+                        # "val_classification_loss": cls_loss.detach().item(),
+                        "val_temperature": temperature.item(),
+                    },
+                    step=global_step,
+                )
 
             global_step += 1
 
     img_feats = torch.cat(image_embeddings, dim=0)
+
     txt_feats = torch.cat(text_embeddings, dim=0)
     avg_cos = (img_feats * txt_feats).sum(dim=1).mean().item()
 

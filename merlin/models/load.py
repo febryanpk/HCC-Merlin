@@ -24,7 +24,7 @@ class Merlin(nn.Module):
         self.repo_id = "stanfordmimi/Merlin"
         self.model = self._load_model()
         self.targets = ["HCC"]
-        # self.targets = pd.read_csv("/media/ryan/T500/Merlin/documentation/phenotypes.csv")["phecode_str"].tolist()
+        # self.targets = pd.read_csv("documentation/phenotypes.csv")["phecode_str"].tolist()
 
     '''
     Load the Merlin model with the initialized weights
