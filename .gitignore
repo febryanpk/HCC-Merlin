@@ -19,3 +19,8 @@ checkpoint/
 
 # logs
 wandb/
+# generated figures
+figures/
+
+# python bytecode
+__pycache__/

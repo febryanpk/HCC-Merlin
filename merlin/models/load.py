@@ -14,6 +14,7 @@ class Merlin(nn.Module):
         self,
         classnames: list = ["negative", "hcc"],
         n_ctx: int = 16,
+        csc: bool = False,
         use_coop: bool = False,
         ImageEmbedding: bool = False,
         HCCClassification: bool = False,
@@ -23,6 +24,7 @@ class Merlin(nn.Module):
         super(Merlin, self).__init__()
         self.classnames = classnames
         self.n_ctx = n_ctx
+        self.csc = csc
         self.use_coop = use_coop
         self.ImageEmbedding = ImageEmbedding
         self.HCCClassification = HCCClassification
@@ -36,7 +38,7 @@ class Merlin(nn.Module):
         self.repo_id = "stanfordmimi/Merlin"
         self.model = self._load_model()
         self.targets = ["HCC"]
-        # self.targets = pd.read_csv("/media/ryan/T500/Merlin/documentation/phenotypes.csv")["phecode_str"].tolist()
+        # self.targets = pd.read_csv("documentation/phenotypes.csv")["phecode_str"].tolist()
 
     """
     Load the Merlin model with the initialized weights
@@ -47,6 +49,7 @@ class Merlin(nn.Module):
         model = MerlinArchitecture(
             classnames=self.classnames,
             n_ctx=self.n_ctx,
+            csc=self.csc,
             use_coop=self.use_coop,
             ImageEmbedding=self.ImageEmbedding,
             HCCClassification=self.HCCClassification,
@@ -56,6 +59,11 @@ class Merlin(nn.Module):
         model.load_state_dict(
             torch.load(os.path.join(self.local_dir, self.checkpoint_name)), strict=False
         )
+        if self.use_coop:
+            # The prompt token embeddings were computed from the vanilla
+            # Clinical-Longformer at construction; refresh them from Merlin's
+            # fine-tuned text encoder that was just loaded.
+            model.prompt_learner.build_token_buffers(model.encode_text.text_encoder)
         return model
 
     """ 

@@ -3,8 +3,7 @@
 temperatures=(0.07 0.5 1.0 10.0)
 tunings=("lora" "full")
 
-# CHECKPOINT_DIR="/media/ryan/T500/checkpoint"
-CHECKPOINT_DIR="/media/ryan/TOSHIBA2/checkpoint_merlin"
+CHECKPOINT_DIR="path/to/checkpoint_dir"
 
 for tuning in "${tunings[@]}"; do
 
@@ -41,7 +40,8 @@ noWD_cgmh_final_no_leakage_lldr_512_warmup_valloss.pth"
         python train.py \
             --phase "venous" \
             --epochs 300 \
-            --batch_size 18 \
+            --train_batch_size 18 \
+            --val_batch_size 18 \
             --tuning "$tuning" \
             --learning_rate "$lr" \
             --temperature "$temp" \

@@ -25,7 +25,7 @@ def evaluate_model(model, val_loader, device, prompts):
         prompts: DiseasePrompts dataclass with positive_prompts and negative_prompts.
 
     Returns:
-        (f1, lower, upper, recall, precision, accuracy, all_preds, all_labels)
+        (f1, lower, upper, recall, precision, accuracy, all_preds, all_labels, auc)
     """
     model.eval()
     image_features_all = []
@@ -69,9 +69,10 @@ def evaluate_model(model, val_loader, device, prompts):
             )  # (1, 2)
 
             all_preds.append(similarities.argmax(dim=1).item())
-            all_probs.append(
-                torch.sigmoid(similarity_positive - similarity_negative).item()
-            )
+            # AUC needs only the ranking, so score with the raw margin: a sigmoid
+            # of the 100x-scaled margin rounds to exactly 0 or 1 for many scans,
+            # and the resulting ties lower the AUC
+            all_probs.append((similarity_positive - similarity_negative).item())
 
     # with torch.no_grad():
     #     text_features = model.model.encode_text(
@@ -131,7 +132,7 @@ def evaluate_model(model, val_loader, device, prompts):
     )
 
     torch.cuda.empty_cache()
-    return f1, lower, upper, rec, prec, acc, all_preds_np, all_labels_np
+    return f1, lower, upper, rec, prec, acc, all_preds_np, all_labels_np, auc
 
 
 def evaluate_coop_model(model, val_loader, device):
@@ -153,16 +154,20 @@ def evaluate_coop_model(model, val_loader, device):
             labels = batch["labels"]
             all_labels.extend(labels.tolist())
 
-            image_features, _, _, text_features = model(img_data, None)
+            with torch.amp.autocast_mode.autocast(
+                device_type=device, dtype=torch.float16
+            ):
+                image_features, _, _, text_features = model(img_data, None)
 
-            similarity = 100.0 * image_features @ text_features.T
-            sim_negative = similarity[:, 0:1]
-            sim_positive = similarity[:, 1:2]
+                similarity = 100.0 * image_features @ text_features.T
+                sim_negative = similarity[:, 0:1]
+                sim_positive = similarity[:, 1:2]
 
-            all_preds.extend(similarity.argmax(dim=1).cpu().tolist())
-            all_probs.extend(
-                torch.sigmoid(sim_positive - sim_negative).squeeze(1).cpu().tolist()
-            )
+                all_preds.extend(similarity.argmax(dim=1).cpu().tolist())
+                # Raw margin for AUC (see evaluate_model); float32 as fp16 adds ties
+                all_probs.extend(
+                    (sim_positive - sim_negative).float().squeeze(1).cpu().tolist()
+                )
 
     all_preds_np = torch.tensor(all_preds).numpy()
     all_labels_np = torch.tensor(all_labels).numpy()
@@ -213,9 +218,8 @@ def evaluate_cocoop_model(model, val_loader, device):
             sim_positive = similarity[:, 1:2]
 
             all_preds.extend(similarity.argmax(dim=1).cpu().tolist())
-            all_probs.extend(
-                torch.sigmoid(sim_positive - sim_negative).squeeze(1).cpu().tolist()
-            )
+            # Raw margin for AUC (see evaluate_model)
+            all_probs.extend((sim_positive - sim_negative).squeeze(1).cpu().tolist())
 
     all_preds_np = torch.tensor(all_preds).numpy()
     all_labels_np = torch.tensor(all_labels).numpy()

@@ -1,29 +1,76 @@
 #!/bin/bash
 
 temperatures=0.07
-tunings="full"
-lr=1e-5
-n_ctx=(2 4 8 16)
+tuning="coop"
+lr=1e-1
+n_ctx=(4)
+n_shot=(1 2 4 8 16)
 
-CHECKPOINT_DIR="/media/ryan/TOSHIBA2/checkpoint_merlin"
+CHECKPOINT_DIR="path/to/checkpoint_dir"
 
 # Loop n_ctx values
-for ctx in "${n_ctx[@]}"; do
+for ctx in "${n_shot[@]}"; do
     echo "========================================="
-    echo "Running with n_ctx = $ctx"
+    echo "Running with n_ctx = ${n_ctx[0]}"
     echo "========================================="
-    SAVE_PATH="${CHECKPOINT_DIR}/Interpolate_HCC_Negative_GradAccumulation8_Venous_50Shot_CoCoOp_${ctx}CTX_lr1e-5_bs18_temp007_epoch50_lldr_512_nowarmup.pth"
+    echo "========================================="
+    echo "Training with $ctx shots"
+    echo "========================================="
+    SAVE_PATH="${CHECKPOINT_DIR}/Experiment1_${ctx}Shot_CSC_CoOp_${n_ctx[0]}CTX_lr${lr}_trainbs32_temp007frozen_epoch200_20260716.pth"
 
     python train.py \
         --phase "venous" \
-        --epochs 50 \
-        --batch_size 18 \
-        --tuning_mode "full" \
+        --epochs 200 \
+        --train_batch_size 32 \
+        --val_batch_size 50 \
+        --tuning_mode "${tuning}" \
+        --n_shot "$ctx" \
         --learning_rate "$lr" \
         --temperature 0.07 \
         --model_save_path "$SAVE_PATH" \
         --evaluate \
         --use_wandb \
-        --use_coop \
-        --n_ctx "$ctx"
+        --csc \
+        --n_ctx "${n_ctx[0]}"
 done
+
+# #!/bin/bash
+
+# temperature=0.07
+# tuning="coop"
+# lr=2e-2
+# n_ctx=(1 2 4 8 16)
+# n_shot=(1 2 4 8 16)
+
+# CHECKPOINT_DIR="path/to/checkpoint_dir"
+
+# # Loop n_ctx values
+# for ctx in "${n_ctx[@]}"; do
+#     echo "========================================="
+#     echo "Running with n_ctx = ${ctx}"
+#     echo "========================================="
+
+#     for shot in "${n_shot[@]}"; do
+#         echo "========================================="
+#         echo "Training with ${shot} shots"
+#         echo "========================================="
+
+#         SAVE_PATH="${CHECKPOINT_DIR}/${shot}Shot_CoOp_${ctx}CTX_lr${lr}_trainbs32_temp007frozen_epoch200_20260715.pth"
+
+#         python train.py \
+#             --phase "venous" \
+#             --epochs 200 \
+#             --train_batch_size 32 \
+#             --val_batch_size 50 \
+#             --tuning_mode "${tuning}" \
+#             --n_shot "${shot}" \
+#             --learning_rate "${lr}" \
+#             --temperature "${temperature}" \
+#             --model_save_path "${SAVE_PATH}" \
+#             --evaluate \
+#             --use_wandb \
+#             --csc \
+#             --n_ctx "${ctx}"
+
+#     done
+# done

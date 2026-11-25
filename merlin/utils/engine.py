@@ -43,22 +43,32 @@ def train_one_epoch(
          image_features, text_features, avg_cosine_similarity)
     """
     model.train()
+    # Keep the pretrained BatchNorm running stats fixed: the image encoder is
+    # frozen or LoRA-adapted, and in train mode its stats would drift (once per
+    # checkpoint recompute, i.e. up to 3x per step)
+    for module in model.modules():
+        if isinstance(module, nn.modules.batchnorm._BatchNorm):
+            module.eval()
+    # CoOp: the text tower is frozen, so keep its dropout off and only the
+    # context vectors receive (deterministic) gradients
+    if args.tuning_mode == "coop":
+        model.model.encode_text.eval()
     total_loss = ctr_loss_sum = cls_loss_sum = 0.0
     image_embeddings, text_embeddings = [], []
 
+    optimizer.zero_grad(set_to_none=True)
     pbar = tqdm(train_loader, desc=f"Training Epoch {epoch + 1}/{args.epochs}")
 
-    for batch in pbar:
+    for batch_idx, batch in enumerate(pbar):
         image = batch["image"].to(device)
 
-        if args.use_coop and not args.tuning_mode == "lora":
+        if args.tuning_mode == "coop":
             text = None
             labels = batch["labels"].to(device).view(-1, 1).float()
         else:
             text_key = "full_text" if global_step % 2 == 0 else "anatomy_text"
             text = [t.lower() for t in batch[text_key]]
 
-        scheduler.step()
         temperature = model.model.temperature
 
         with autocast(dtype=torch.float16):
@@ -69,7 +79,7 @@ def train_one_epoch(
 
             image_embeddings.append(img_emb.detach().cpu())
 
-            if args.use_coop and not args.tuning_mode == "lora":
+            if args.tuning_mode == "coop":
                 logits = (img_emb @ txt_emb.T) / temperature
                 # logits = torch.einsum("bd,bcd->bc", img_emb, txt_emb) / temperature
                 ctr_loss = nn.CrossEntropyLoss()(logits, labels.view(-1).long())
@@ -95,28 +105,56 @@ def train_one_epoch(
             # cls_loss = classification_loss_fn(hcc_emb, labels)
             loss = ctr_loss
 
-        scaler.scale(loss).backward()
+        loss_for_backward = loss / accumulation_steps
+        scaler.scale(loss_for_backward).backward()
 
-        # Turn off gradient accumulation for now to see if it helps with training stability. Will re-enable after confirming.
-        if args.use_coop and not args.tuning_mode == "lora":
+        should_step = (batch_idx + 1) % accumulation_steps == 0 or (
+            batch_idx + 1
+        ) == len(train_loader)
+        if should_step:
+            prompt_ctx = getattr(
+                getattr(model.model, "prompt_learner", None), "ctx", None
+            )
+            debug_coop = (
+                args.tuning_mode == "coop"
+                and prompt_ctx is not None
+                and epoch == 0
+                and batch_idx < 3
+            )
+            prompt_before = prompt_ctx.detach().clone() if debug_coop else None
+            prompt_grad_norm = (
+                prompt_ctx.grad.detach().float().norm().item()
+                if debug_coop and prompt_ctx.grad is not None
+                else None
+            )
+            prompt_lr = optimizer.param_groups[0]["lr"] if debug_coop else None
+
             scaler.step(optimizer)
             scaler.update()
-            optimizer.zero_grad()
 
-        # if (global_step + 1) % accumulation_steps == 0:
-        #     scaler.step(optimizer)
-        #     scaler.update()
-        #     optimizer.zero_grad()
+            if debug_coop:
+                prompt_delta_norm = (
+                    (prompt_ctx.detach().float() - prompt_before.float()).norm().item()
+                )
+                print(
+                    "CoOp update debug | "
+                    f"step={global_step} lr={prompt_lr:.8g} "
+                    f"grad_norm={prompt_grad_norm:.8g} "
+                    f"delta_norm={prompt_delta_norm:.8g}"
+                )
 
-        loss_val = loss.detach().item()
-        total_loss += loss_val
+            optimizer.zero_grad(set_to_none=True)
+            scheduler.step()
+
+        loss_train = loss.detach().item()
+        total_loss += loss_train
         ctr_loss_sum += ctr_loss.detach().item()
         # cls_loss_sum += cls_loss.detach().item()
 
         if args.use_wandb:
             wandb.log(
                 {
-                    "train_batch_loss": loss_val,
+                    "train_batch_loss": loss_train,
                     "train_contrastive_loss": ctr_loss.detach().item(),
                     # "train_classification_loss": cls_loss.detach().item(),
                     "train_learning_rate": optimizer.param_groups[0]["lr"],
@@ -129,7 +167,7 @@ def train_one_epoch(
 
     img_feats = torch.cat(image_embeddings, dim=0)
 
-    if args.use_coop and not args.tuning_mode == "lora":
+    if args.tuning_mode == "coop":
         avg_cos = 0.0
         txt_feats = txt_emb.detach().cpu()
     else:
@@ -184,7 +222,7 @@ def validate_one_epoch(
         ):
             image = batch["image"].to(device)
 
-            if args.use_coop and not args.tuning_mode == "lora":
+            if args.tuning_mode == "coop":
                 text = None
                 labels = batch["labels"].to(device).view(-1, 1).float()
             else:
@@ -202,9 +240,7 @@ def validate_one_epoch(
 
                 image_embeddings.append(img_emb.detach().cpu())
 
-                text_embeddings.append(txt_emb.detach().cpu())
-
-                if args.use_coop and not args.tuning_mode == "lora":
+                if args.tuning_mode == "coop":
                     logits = (img_emb @ txt_emb.T) / temperature
                     # logits = torch.einsum("bd,bcd->bc", img_emb, txt_emb) / temperature
                     ctr_loss = nn.CrossEntropyLoss()(logits, labels.view(-1).long())
@@ -229,6 +265,7 @@ def validate_one_epoch(
                 loss = ctr_loss
 
             loss_val = loss.detach().item()
+            total_loss += loss_val
             ctr_loss_sum += ctr_loss.detach().item()
             # cls_loss_sum += cls_loss.detach().item()
 
@@ -247,7 +284,7 @@ def validate_one_epoch(
 
     img_feats = torch.cat(image_embeddings, dim=0)
 
-    if args.use_coop and not args.tuning_mode == "lora":
+    if args.tuning_mode == "coop":
         avg_cos = 0.0
         txt_feats = txt_emb.detach().cpu()
     else:

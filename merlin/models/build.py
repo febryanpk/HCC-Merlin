@@ -72,108 +72,95 @@ class TextEncoder(nn.Module):
 
 
 class PromptLearner(nn.Module):
-    def __init__(self, classnames, n_ctx, tokenizer, model, device="cuda"):
+    """CoOp prompt learner.
+
+    Each class prompt is fed to the frozen text encoder as input embeddings:
+        [<s>] [ctx_1 ... ctx_n] [class name tokens] [</s>] [<pad> ...]
+    Only `ctx` is learnable; the <s>/class/</s> slots hold the text encoder's
+    word embeddings (`token_prefix` / `token_suffix`).
+
+    csc=False: one unified context shared by all classes, ctx (n_ctx, hidden).
+    csc=True:  class-specific context, ctx (n_cls, n_ctx, hidden).
+    """
+
+    def __init__(
+        self, classnames, n_ctx, tokenizer, text_encoder, csc=False, device="cuda"
+    ):
         super().__init__()
         n_cls = len(classnames)
-        hidden_size = model.config.hidden_size
-        self.device = device
+        hidden_size = text_encoder.config.hidden_size
 
-        # Initialize random continuous learnable context vectors
-        ctx_vectors = torch.empty(n_ctx, hidden_size)
+        # Random init of the learnable context vectors
+        if csc:
+            ctx_vectors = torch.empty(n_cls, n_ctx, hidden_size)
+        else:
+            ctx_vectors = torch.empty(n_ctx, hidden_size)
         nn.init.normal_(ctx_vectors, std=0.02)
-        prompt_prefix = " ".join(["X"] * n_ctx)
+        self.ctx = nn.Parameter(ctx_vectors.to(device))
+        print(f"Context: {'class-specific' if csc else 'unified'}")
 
+        # "X" is a single BPE token for Clinical-Longformer, so each placeholder
+        # occupies exactly one position and is replaced by one ctx vector
+        prompt_prefix = " ".join(["X"] * n_ctx)
         print(f'Initial context: "{prompt_prefix}"')
         print(f"Number of context words (tokens): {n_ctx}")
 
-        self.ctx = nn.Parameter(ctx_vectors)  # (n_ctx, hidden_size)
-
         classnames = [name.replace("_", " ") for name in classnames]
-        name_lens = [len(tokenizer(name)["input_ids"]) for name in classnames]
         prompts = [prompt_prefix + " " + name for name in classnames]
+        tokenized = tokenizer(
+            prompts, truncation=True, padding=True, return_tensors="pt"
+        )
+        input_ids = tokenized["input_ids"].to(device)  # (n_cls, seq_len)
+        attention_mask = tokenized["attention_mask"].to(device)
 
-        # Tokenize with padding=True so all classes match longest sequence
-        tokenized = tokenizer(prompts, padding=True, return_tensors="pt")
-        tokenized_prompts = tokenized["input_ids"].to(device)  # (n_cls, max_seq_len)
-        raw_attention_mask = tokenized["attention_mask"].to(
-            device
-        )  # (n_cls, max_seq_len)
+        # Position ids exactly as the encoder derives them from input_ids
+        # (pads -> padding_idx). With inputs_embeds it would otherwise fall back
+        # to plain sequential positions.
+        padding_idx = text_encoder.config.pad_token_id
+        position_ids = (
+            torch.cumsum(attention_mask, dim=1) * attention_mask + padding_idx
+        ).long()
 
-        print(f"Tokenized prompts shape (unified): {tokenized_prompts.shape}")
-
-        # Extract the static embeddings from the frozen model
-        with torch.no_grad():
-            embedding = model.embeddings.word_embeddings(
-                tokenized_prompts
-            )  # (n_cls, max_seq_len, hidden_size)
-            embedding = embedding.to(device)
-
-        # 4. Slice properly based on Longformer structure: [<s>, n_ctx dummy tokens, class_name + </s> + padding]
-        self.register_buffer(
-            "token_prefix", embedding[:, :1, :]
-        )  # <s> token -> (n_cls, 1, hidden_size)
-        self.register_buffer(
-            "token_suffix", embedding[:, 1 + n_ctx :, :]
-        )  # [Class + </s> + pad] -> (n_cls, max_seq_len - 1 - n_ctx, hidden_size)
-
-        # Align the masks by dropping the dummy "X" token indices
-        prefix_mask = raw_attention_mask[:, :1]
-        suffix_mask = raw_attention_mask[:, 1 + n_ctx :]
-
-        # Create a dynamic attention mask for the learnable tokens (always 1s)
-        ctx_mask = torch.ones(n_cls, n_ctx, device=device)
-
-        # Reconstruct full attention mask matching the forward pass sequence layout
-        extended_attention_mask = torch.cat([prefix_mask, ctx_mask, suffix_mask], dim=1)
-        self.register_buffer("attention_mask", extended_attention_mask)
-
-        # Set global attention to the prefix token, 1: local attention, 0: no attention, 2: global attention (Longformer specific)
-        global_attention_mask = torch.zeros_like(extended_attention_mask)
-        global_attention_mask[:, 0] = 1  # Set <s> token to have global attention
-        self.register_buffer("global_attention_mask", global_attention_mask)
+        # Derived from the class names and the frozen encoder, so they are
+        # rebuilt rather than saved/loaded with checkpoints
+        self.register_buffer("input_ids", input_ids, persistent=False)
+        self.register_buffer("attention_mask", attention_mask, persistent=False)
+        self.register_buffer("position_ids", position_ids, persistent=False)
 
         self.n_cls = n_cls
         self.n_ctx = n_ctx
-        self.tokenized_prompts = tokenized_prompts
-        self.name_lens = name_lens
+        self.build_token_buffers(text_encoder)
+
+    @torch.no_grad()
+    def build_token_buffers(self, text_encoder):
+        """(Re)compute the frozen <s> / class / </s> token embeddings.
+
+        Must be called again after loading pretrained text-encoder weights,
+        otherwise the buffers hold the embeddings of the old weights.
+        """
+        embedding = text_encoder.get_input_embeddings()(self.input_ids)
+        self.register_buffer(
+            "token_prefix", embedding[:, :1, :].clone(), persistent=False
+        )  # <s>
+        self.register_buffer(
+            "token_suffix", embedding[:, 1 + self.n_ctx :, :].clone(), persistent=False
+        )  # class name + </s> + pad
 
     def forward(self):
         ctx = self.ctx
-        if ctx.dim() == 2:
-            ctx = ctx.unsqueeze(0).expand(
-                self.n_cls, -1, -1
-            )  # (n_cls, n_ctx, hidden_size)
-
-        prefix = self.token_prefix
-        suffix = self.token_suffix
-
-        # Reconstruct the continuous input sequence: [ <s>, learnable_ctx, class_text_embeddings ]
-        prompts = torch.cat(
-            [prefix, ctx, suffix], dim=1
-        )  # (n_cls, max_seq_len, hidden_size)
-
-        # Set class token in front of the learnable context tokens
-        # prompts = []
-        # for i in range(self.n_cls):
-        #     name_len = self.name_lens[i]
-        #     prefix_i = prefix[i : i + 1, :, :]
-        #     class_i = suffix[i : i + 1, :name_len, :]
-        #     suffix_i = suffix[i : i + 1, name_len:, :]
-        #     ctx_i = ctx[i : i + 1, :, :]
-        #     prompt = torch.cat([prefix_i, class_i, ctx_i, suffix_i], dim=1)  # (1, max_seq_len, hidden_size)
-        #     prompts.append(prompt)
-        # prompts = torch.cat(prompts, dim=0)  # (n_cls, max_seq_len, hidden_size)
-
-        return prompts
+        if ctx.dim() == 2:  # generic (shared) context
+            ctx = ctx.unsqueeze(0).expand(self.n_cls, -1, -1)
+        # (n_cls, seq_len, hidden)
+        return torch.cat([self.token_prefix, ctx, self.token_suffix], dim=1)
 
 
 class CoCoOpPromptLearner(PromptLearner):
     def __init__(
-        self, classnames, n_ctx, tokenizer, model, image_dim=512, device="cuda"
+        self, classnames, n_ctx, tokenizer, text_encoder, image_dim=512, device="cuda"
     ):
-        super().__init__(classnames, n_ctx, tokenizer, model, device)
+        super().__init__(classnames, n_ctx, tokenizer, text_encoder, device)
 
-        hidden_size = model.config.hidden_size  # 768 for Clinical-Longformer
+        hidden_size = text_encoder.config.hidden_size  # 768 for Clinical-Longformer
         self.meta_net = nn.Sequential(
             nn.Linear(image_dim, image_dim // 16),
             nn.ReLU(inplace=True),
@@ -216,6 +203,7 @@ class MerlinArchitecture(nn.Module):
         self,
         classnames: list = ["negative", "hcc"],
         n_ctx: int = 16,
+        csc: bool = False,
         use_coop: bool = False,
         init_logit_scale: float = 1.0,
         ImageEmbedding: bool = False,
@@ -239,7 +227,8 @@ class MerlinArchitecture(nn.Module):
             rotate_flip=self.rotate_flip,
         ).to(device)
 
-        # Initialize Base Text Encoder
+        # Same text tower in both modes; CoOp feeds it prompt embeddings instead
+        # of tokenised reports (see encode_coop_text)
         self.encode_text = TextEncoder().to(device)
 
         # Configure architecture based on CoOp initialization choice
@@ -261,7 +250,8 @@ class MerlinArchitecture(nn.Module):
                 classnames=classnames,
                 n_ctx=n_ctx,
                 tokenizer=self.encode_text.tokenizer,
-                model=self.encode_text.text_encoder,
+                text_encoder=self.encode_text.text_encoder,
+                csc=csc,
                 device=device,
             )
 
@@ -270,21 +260,28 @@ class MerlinArchitecture(nn.Module):
             #     classnames=classnames,
             #     n_ctx=n_ctx,
             #     tokenizer=self.encode_text.tokenizer,
-            #     model=self.encode_text.text_encoder,
+            #     text_encoder=self.encode_text.text_encoder,
             #     device=device
             # )
 
         self.logit_scale = nn.Parameter(torch.ones([]) * init_logit_scale)
 
     def encode_coop_text(self):
-        token_inputs = self.prompt_learner()
+        """Encode the learned class prompts with the frozen text tower.
+
+        Mirrors TextEncoder.forward ([CLS] state -> linear_layer, no global
+        attention) so the prompts live in Merlin's image-text space. The text
+        encoder is frozen via requires_grad=False, not no_grad, so gradients
+        still reach the context vectors.
+        """
+        prompts = self.prompt_learner()  # (n_cls, seq_len, hidden)
         text_outputs = self.encode_text.text_encoder(
-            inputs_embeds=token_inputs,
+            inputs_embeds=prompts,
             attention_mask=self.prompt_learner.attention_mask,
-            global_attention_mask=self.prompt_learner.global_attention_mask,
+            position_ids=self.prompt_learner.position_ids,
         )
-        raw_text_features = text_outputs.last_hidden_state[:, 0, :]
-        return self.encode_text.linear_layer(raw_text_features)
+        cls_state = text_outputs.last_hidden_state[:, 0, :]
+        return self.encode_text.linear_layer(cls_state)  # (n_cls, 512)
 
     def encode_cocoop_text(self, image_features):
         prompts = self.prompt_learner(image_features)
@@ -298,8 +295,8 @@ class MerlinArchitecture(nn.Module):
             .reshape(B * C, L)
         )
 
-        global_attention_mask = (
-            self.prompt_learner.global_attention_mask.unsqueeze(0)
+        position_ids = (
+            self.prompt_learner.position_ids.unsqueeze(0)
             .expand(B, -1, -1)
             .reshape(B * C, L)
         )
@@ -307,7 +304,7 @@ class MerlinArchitecture(nn.Module):
         text_outputs = self.encode_text.text_encoder(
             inputs_embeds=prompts,
             attention_mask=attention_mask,
-            global_attention_mask=global_attention_mask,
+            position_ids=position_ids,
         )
 
         raw = text_outputs.last_hidden_state[:, 0, :]

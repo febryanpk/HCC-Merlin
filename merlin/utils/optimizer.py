@@ -217,13 +217,11 @@ def build_optimizer_and_scheduler(
                 "weight_decay": 0.0,
             }
         )
-    # if args.use_coop:
-    optimizer = torch.optim.SGD(param_groups, weight_decay=1e-4)
-    print(optimizer.param_groups[0]["params"][0].shape)
-    print(optimizer.param_groups[0]["lr"])
-
-    # else:
-    # optimizer = torch.optim.AdamW(param_groups, betas=(0.9, 0.999))
+    # SGD is reserved for CoOp prompt tuning; contrastive fine-tuning uses AdamW
+    if args.tuning_mode == "coop":
+        optimizer = torch.optim.SGD(param_groups, weight_decay=1e-4)
+    else:
+        optimizer = torch.optim.AdamW(param_groups, betas=(0.9, 0.999))
 
     warmup_scheduler = torch.optim.lr_scheduler.LambdaLR(
         optimizer,
